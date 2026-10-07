@@ -79,6 +79,15 @@ const fileRegistry = new Map<string, AudioFileRecord>();
 // In-flight conversion deduplication to prevent racing or duplicate requests
 const inFlightConversions = new Map<string, Promise<{ success: boolean; cachedPath?: string; title?: string; error?: string }>>();
 
+// Job registry for SSE progress
+interface ConversionJob {
+  status: 'pending' | 'downloading' | 'extracting' | 'finalizing' | 'completed' | 'error';
+  progress: number; // 0-100
+  error?: string;
+  result?: any;
+}
+const jobRegistry = new Map<string, ConversionJob>();
+
 function getFormatDetails(format: string, bitrate: string = '320k') {
   const fmt = (format || 'mp3').toLowerCase();
   const bRate = bitrate || '320k';
@@ -419,6 +428,37 @@ async function fetchMasterAudioForVideo(
   }
 }
 
+// SSE progress endpoint
+app.get('/api/convert-progress/:jobId', (req, res) => {
+  const { jobId } = req.params;
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  const sendProgress = (job: ConversionJob) => {
+    res.write(`data: ${JSON.stringify(job)}\n\n`);
+  };
+
+  const job = jobRegistry.get(jobId);
+  if (job) {
+    sendProgress(job);
+  }
+
+  // Simple interval-based update for SSE
+  const interval = setInterval(() => {
+    const currentJob = jobRegistry.get(jobId);
+    if (currentJob) {
+      sendProgress(currentJob);
+      if (currentJob.status === 'completed' || currentJob.status === 'error') {
+        clearInterval(interval);
+        res.end();
+      }
+    }
+  }, 1000);
+
+  req.on('close', () => clearInterval(interval));
+});
+
 // ---------------------------------------------------------------------------
 // API Routes
 // ---------------------------------------------------------------------------
@@ -516,95 +556,99 @@ app.get('/api/youtube-info', async (req, res) => {
   }
 });
 
-// 2. Convert YouTube to Audio
+// 2. Convert YouTube to Audio (Async)
 app.post('/api/convert-youtube', async (req, res) => {
   const { url, format = 'mp3', customName } = req.body;
-  if (!url) {
-    return res.status(400).json({ ok: false, error: 'ইউটিউব লিঙ্ক আবশ্যক।' });
-  }
+  if (!url) return res.status(400).json({ ok: false, error: 'ইউটিউব লিঙ্ক আবশ্যক।' });
 
   const videoId = extractYouTubeId(url);
-  if (!videoId) {
-    return res.status(400).json({ ok: false, error: 'সঠিক ইউটিউব লিঙ্ক পাওয়া যায়নি।' });
-  }
+  if (!videoId) return res.status(400).json({ ok: false, error: 'সঠিক ইউটিউব লিঙ্ক পাওয়া যায়নি।' });
 
-  try {
-    // 1. Fetch title via oEmbed
-    let videoTitle = 'youtube-audio';
+  const jobId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  jobRegistry.set(jobId, { status: 'pending', progress: 0 });
+
+  // Run conversion in background
+  (async () => {
     try {
-      const oembed = await fetch(
-        `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
-        { signal: AbortSignal.timeout(3000) }
-      );
-      if (oembed.ok) {
-        const d = await oembed.json();
-        if (d.title) videoTitle = d.title;
+      jobRegistry.set(jobId, { status: 'downloading', progress: 10 });
+      // 1. Fetch title
+      let videoTitle = 'youtube-audio';
+      try {
+        const oembed = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`, { signal: AbortSignal.timeout(3000) });
+        if (oembed.ok) {
+          const d = await oembed.json();
+          if (d.title) videoTitle = d.title;
+        }
+      } catch {}
+
+      const targetFormat = format && format !== 'auto' ? format.toLowerCase() : 'mp3';
+      const fmtDetails = getFormatDetails(targetFormat);
+      const baseName = sanitizeFilename(customName || videoTitle || 'youtube-audio');
+      const finalFilename = `${baseName}${fmtDetails.ext}`;
+      const fileId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+      const outputFilePath = path.join(OUTPUTS_DIR, `${fileId}${fmtDetails.ext}`);
+
+      jobRegistry.set(jobId, { status: 'downloading', progress: 30 });
+      // Fetch or reuse master audio stream
+      const masterResult = await fetchMasterAudioForVideo(videoId);
+
+      if (!masterResult.success || !masterResult.cachedPath || !fs.existsSync(masterResult.cachedPath)) {
+        jobRegistry.set(jobId, { status: 'error', progress: 0, error: 'ইউটিউব ভিডিও থেকে অডিও পাওয়া যায়নি।' });
+        return;
       }
-    } catch {}
 
-    const targetFormat = format && format !== 'auto' ? format.toLowerCase() : 'mp3';
-    const fmtDetails = getFormatDetails(targetFormat);
-    const baseName = sanitizeFilename(customName || videoTitle || 'youtube-audio');
-    const finalFilename = `${baseName}${fmtDetails.ext}`;
-    const fileId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-    const outputFilePath = path.join(OUTPUTS_DIR, `${fileId}${fmtDetails.ext}`);
+      jobRegistry.set(jobId, { status: 'extracting', progress: 60 });
+      const qualityAnalysis = await analyzeMediaQuality(masterResult.cachedPath);
+      const targetBitrate = qualityAnalysis.recommendedBitrate || '320k';
+      
+      jobRegistry.set(jobId, { status: 'finalizing', progress: 85 });
+      const transcodeOk = await transcodeAudioFile(
+        masterResult.cachedPath,
+        targetFormat,
+        outputFilePath,
+        targetBitrate
+      );
 
-    // Fetch or reuse master audio stream
-    const masterResult = await fetchMasterAudioForVideo(videoId);
+      if (!transcodeOk || !fs.existsSync(outputFilePath)) {
+        jobRegistry.set(jobId, { status: 'error', progress: 0, error: 'অডিও ট্রান্সকোডিং ব্যর্থ হয়েছে।' });
+        return;
+      }
 
-    if (!masterResult.success || !masterResult.cachedPath || !fs.existsSync(masterResult.cachedPath)) {
-      return res.status(500).json({
-        ok: false,
-        error: 'ইউটিউব ভিডিও থেকে অডিও পাওয়া যায়নি। ভিডিওটি রেস্ট্রিক্টেড বা প্রাইভেট হতে পারে।',
+      const stat = fs.statSync(outputFilePath);
+      const exactDuration = await getAudioDurationSeconds(outputFilePath);
+
+      const record: AudioFileRecord = {
+        id: fileId,
+        filePath: outputFilePath,
+        fileName: finalFilename,
+        format: targetFormat,
+        mimeType: fmtDetails.mimeType,
+        fileSize: stat.size,
+        duration: exactDuration || undefined,
+        createdAt: Date.now(),
+      };
+      fileRegistry.set(fileId, record);
+
+      jobRegistry.set(jobId, { 
+        status: 'completed', 
+        progress: 100,
+        result: {
+          fileId,
+          fileName: finalFilename,
+          format: targetFormat.toUpperCase(),
+          fileSize: stat.size,
+          duration: exactDuration,
+          downloadUrl: `/api/download/${fileId}`,
+          streamUrl: `/api/stream/${fileId}`,
+        }
       });
+    } catch (error: any) {
+      console.error('Convert youtube background error:', error);
+      jobRegistry.set(jobId, { status: 'error', progress: 0, error: error.message || 'কনভার্ট ব্যর্থ হয়েছে।' });
     }
+  })();
 
-    // Hidden logic: analyze source audio quality and automatically set output bitrate to high (320kbps for YouTube)
-    const qualityAnalysis = await analyzeMediaQuality(masterResult.cachedPath);
-    const targetBitrate = qualityAnalysis.recommendedBitrate || '320k';
-    const transcodeOk = await transcodeAudioFile(
-      masterResult.cachedPath,
-      targetFormat,
-      outputFilePath,
-      targetBitrate
-    );
-
-    if (!transcodeOk || !fs.existsSync(outputFilePath)) {
-      return res.status(500).json({
-        ok: false,
-        error: 'অডিও ট্রান্সকোডিং ব্যর্থ হয়েছে। অনুগ্রহ করে আবার চেষ্টা করুন।',
-      });
-    }
-
-    const stat = fs.statSync(outputFilePath);
-    const exactDuration = await getAudioDurationSeconds(outputFilePath);
-
-    const record: AudioFileRecord = {
-      id: fileId,
-      filePath: outputFilePath,
-      fileName: finalFilename,
-      format: targetFormat,
-      mimeType: fmtDetails.mimeType,
-      fileSize: stat.size,
-      duration: exactDuration || undefined,
-      createdAt: Date.now(),
-    };
-    fileRegistry.set(fileId, record);
-
-    return res.json({
-      ok: true,
-      fileId,
-      fileName: finalFilename,
-      format: targetFormat.toUpperCase(),
-      fileSize: stat.size,
-      duration: exactDuration,
-      downloadUrl: `/api/download/${fileId}`,
-      streamUrl: `/api/stream/${fileId}`,
-    });
-  } catch (error: any) {
-    console.error('Convert youtube error:', error);
-    return res.status(500).json({ ok: false, error: error.message || 'কনভার্ট ব্যর্থ হয়েছে।' });
-  }
+  return res.json({ ok: true, jobId });
 });
 
 // 3. Convert uploaded video file to audio

@@ -133,6 +133,28 @@ export default function App() {
     };
   }, []);
 
+  // Tactical feedback helper
+  const triggerVibration = (type: 'light' | 'heavy' | 'double') => {
+    if (!('vibrate' in navigator)) return;
+    if (type === 'light') navigator.vibrate(50);
+    if (type === 'heavy') navigator.vibrate(200);
+    if (type === 'double') navigator.vibrate([100, 50, 100]);
+  };
+
+  // Notification helper
+  const showNotification = (title: string, body: string) => {
+    if (!('Notification' in window)) return;
+    if (Notification.permission === 'granted') {
+      new Notification(title, { body });
+    } else if (Notification.permission !== 'denied') {
+      Notification.requestPermission().then((permission) => {
+        if (permission === 'granted') {
+          new Notification(title, { body });
+        }
+      });
+    }
+  };
+
   const showToast = (msg: string) => {
     setToastMessage(msg);
     setTimeout(() => {
@@ -172,6 +194,9 @@ export default function App() {
     if (status === 'fetching' || status === 'downloading') {
       return;
     }
+
+    // Vibration on click
+    triggerVibration('light');
 
     // If completed or error, reset to idle on tap
     if (status === 'completed' || status === 'error') {
@@ -215,104 +240,86 @@ export default function App() {
       setProgressPercent(0);
       setCurrentMb(0);
 
-      // 1. Fetch metadata (oEmbed / YouTube info)
+      // 1. Fetch metadata
       let videoTitle = 'audio-track';
       let estimatedSize = 4.5;
-
       try {
-        const infoRes = await fetch(`/api/youtube-info?url=${encodeURIComponent(targetUrl)}`, {
-          signal: AbortSignal.timeout(6000),
-        });
+        const infoRes = await fetch(`/api/youtube-info?url=${encodeURIComponent(targetUrl)}`, { signal: AbortSignal.timeout(6000) });
         if (infoRes.ok) {
           const infoData: YouTubeInfo = await infoRes.json();
           if (infoData.title) videoTitle = infoData.title;
           if (infoData.audioSize) {
             const parsed = parseFloat(infoData.audioSize.replace(/[^\d.]/g, ''));
             if (!isNaN(parsed) && parsed > 0) estimatedSize = parsed;
-          } else if (infoData.duration) {
-            const parts = infoData.duration.split(':').map((p) => parseInt(p, 10));
-            const sec = parts.length === 2 ? parts[0] * 60 + parts[1] : 200;
-            estimatedSize = parseFloat(((sec * 24) / 1024).toFixed(1));
           }
         }
-      } catch {
-        // Fallback estimate if timeout
-      }
-
+      } catch {}
       setTotalMb(estimatedSize);
 
-      // 2. Switch to downloading state
+      // 2. Request conversion (Async)
       setStatus('downloading');
-      setProgressPercent(11);
-      setCurrentMb(parseFloat((estimatedSize * 0.11).toFixed(1)));
-
-      // Smooth progress simulation while server transcodes high-quality 320kbps audio
-      let currentP = 11;
-      const progressInterval = setInterval(() => {
-        currentP += Math.floor(Math.random() * 5) + 3;
-        if (currentP > 94) currentP = 94;
-        setProgressPercent(currentP);
-        setCurrentMb(parseFloat((estimatedSize * (currentP / 100)).toFixed(1)));
-      }, 350);
-
-      // 3. Request conversion from server
       const convertRes = await fetch('/api/convert-youtube', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          url: targetUrl,
-          format: 'mp3',
-          customName: videoTitle,
-        }),
+        body: JSON.stringify({ url: targetUrl, format: 'mp3', customName: videoTitle }),
+      });
+      const { ok, jobId, error } = await convertRes.json();
+      if (!ok) throw new Error(error || 'কনভার্ট শুরু করা যায়নি।');
+
+      // 3. SSE Progress tracking
+      const eventSource = new EventSource(`/api/convert-progress/${jobId}`);
+      
+      const progressPromise = new Promise<any>((resolve, reject) => {
+        eventSource.onmessage = (event) => {
+          const job = JSON.parse(event.data);
+          if (job.status === 'completed') {
+            setProgressPercent(99);
+            eventSource.close();
+            resolve(job.result);
+          } else if (job.status === 'error') {
+            eventSource.close();
+            reject(new Error(job.error || 'কনভার্ট ব্যর্থ হয়েছে।'));
+          } else {
+            setProgressPercent(Math.min(job.progress, 98)); // Cap at 98%
+            setCurrentMb(parseFloat((estimatedSize * (job.progress / 100)).toFixed(1)));
+          }
+        };
+        eventSource.onerror = () => {
+          eventSource.close();
+          reject(new Error('প্রোগ্রেস ট্র্যাকিংয়ে সমস্যা হয়েছে।'));
+        };
       });
 
-      clearInterval(progressInterval);
-
-      if (!convertRes.ok) {
-        const errData = await convertRes.json().catch(() => ({}));
-        throw new Error(errData.error || 'কনভার্ট ব্যর্থ হয়েছে। লিঙ্কটি পুনরায় পরীক্ষা করুন।');
-      }
-
-      const convertData = await convertRes.json();
-      if (!convertData.ok) {
-        throw new Error(convertData.error || 'অডিও তৈরি করা যায়নি।');
-      }
-
-      const finalSize = convertData.fileSize || Math.round(estimatedSize * 1024 * 1024);
-      const finalSizeMb = parseFloat((finalSize / (1024 * 1024)).toFixed(1));
+      const convertData = await progressPromise;
 
       // 4. Completed state
-      setTotalMb(finalSizeMb);
-      setCurrentMb(finalSizeMb);
       setProgressPercent(100);
       setStatus('completed');
-
-      // Auto-trigger audio download directly without prompt
+      triggerVibration('double');
+      if (document.visibilityState === 'hidden') {
+        showNotification('Download Completed!', `${videoTitle} is ready.`);
+      }
       triggerAutoDownload(convertData.downloadUrl, convertData.fileName);
-
+      
       // Add to history
       const newHistoryItem: HistoryItem = {
-        id: convertData.fileId || `${Date.now()}`,
+        id: convertData.fileId,
         title: videoTitle,
         fileName: convertData.fileName,
         downloadUrl: convertData.downloadUrl,
-        streamUrl: convertData.streamUrl || convertData.downloadUrl,
-        fileSize: finalSize,
+        streamUrl: convertData.streamUrl,
+        fileSize: convertData.fileSize,
         format: 'MP3 320kbps',
         duration: convertData.duration,
         timestamp: Date.now(),
       };
-
       setHistory((prev) => [newHistoryItem, ...prev.filter((i) => i.id !== newHistoryItem.id)]);
-
-      // Auto return to idle after 4 seconds
-      setTimeout(() => {
-        setStatus((cur) => (cur === 'completed' ? 'idle' : cur));
-      }, 4000);
+      
+      setTimeout(() => setStatus((cur) => (cur === 'completed' ? 'idle' : cur)), 4000);
     } catch (err: any) {
       console.error(err);
       setStatus('error');
-      setErrorMessage(err.message || 'একটি ত্রুটি ঘটেছে। পুনরায় চেষ্টা করুন।');
+      setErrorMessage(err.message || 'একটি ত্রুটি ঘটেছে।');
     }
   };
 
@@ -570,9 +577,7 @@ export default function App() {
         <div className="w-full flex flex-col items-center justify-center text-center min-h-[90px] mt-8">
           {/* 1. Idle state hint */}
           {status === 'idle' && (
-            <p className="text-[#848897] text-xs sm:text-sm tracking-widest font-light uppercase transition-opacity">
-              Tap circle to download copied link
-            </p>
+            <div className="h-6" />
           )}
 
           {/* 2. Fetching state: Link is hidden, display 'Loading...' */}
