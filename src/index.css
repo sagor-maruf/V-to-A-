@@ -1,29 +1,30 @@
 @import "tailwindcss";
 
-@keyframes shimmer {
-  0% {
-    transform: translateX(-100%);
-  }
-  100% {
-    transform: translateX(200%);
-  }
-}
-
-.animate-shimmer {
-  animation: shimmer 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-}
-
-@keyframes pulse-subtle {
+@keyframes pulse-glow {
   0%, 100% {
-    opacity: 1;
+    box-shadow: 0 0 45px rgba(255, 255, 255, 0.12), inset 0 0 25px rgba(255, 255, 255, 0.05);
     transform: scale(1);
   }
   50% {
-    opacity: 0.88;
+    box-shadow: 0 0 75px rgba(255, 255, 255, 0.28), inset 0 0 35px rgba(255, 255, 255, 0.1);
     transform: scale(1.02);
   }
 }
 
-.animate-pulse-subtle {
-  animation: pulse-subtle 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+@keyframes spin-slow {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
 }
+
+.animate-pulse-glow {
+  animation: pulse-glow 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+.animate-spin-slow {
+  animation: spin-slow 8s linear infinite;
+}
+
