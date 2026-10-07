@@ -599,7 +599,7 @@ app.post('/api/convert-youtube', async (req, res) => {
 
       jobRegistry.set(jobId, { status: 'extracting', progress: 60 });
       const qualityAnalysis = await analyzeMediaQuality(masterResult.cachedPath);
-      const targetBitrate = qualityAnalysis.recommendedBitrate || '320k';
+      const targetBitrate = req.body.bitrate || qualityAnalysis.recommendedBitrate || '320k';
       
       jobRegistry.set(jobId, { status: 'finalizing', progress: 85 });
       const transcodeOk = await transcodeAudioFile(
@@ -657,16 +657,16 @@ app.post('/api/convert-video', upload.single('video'), async (req, res) => {
     return res.status(400).json({ ok: false, error: 'ভিডিও ফাইল সিলেক্ট করুন।' });
   }
 
-  const { format = 'mp3', customName } = req.body;
+  const { format = 'mp3', customName, bitrate } = req.body;
   const inputFilePath = req.file.path;
 
   const originalBase = path.parse(req.file.originalname).name;
   const baseName = sanitizeFilename(customName || originalBase || 'converted-audio');
   const targetFormat = format && format !== 'auto' ? format.toLowerCase() : 'mp3';
 
-  // Analyze source video quality and set output bitrate to high (320kbps)
+  // Analyze source video quality and set output bitrate
   const qualityAnalysis = await analyzeMediaQuality(inputFilePath);
-  const targetBitrate = qualityAnalysis.recommendedBitrate || '320k';
+  const targetBitrate = bitrate || qualityAnalysis.recommendedBitrate || '320k';
   const fmtDetails = getFormatDetails(targetFormat, targetBitrate);
 
   const finalFilename = `${baseName}${fmtDetails.ext}`;

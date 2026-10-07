@@ -232,7 +232,19 @@ export default function App() {
     startDownloadFromUrl(cleanUrl);
   };
 
-  // Main download & conversion pipeline
+  const [audioQuality, setAudioQuality] = useState<string>(() => localStorage.getItem('v_to_a_quality') || '320k');
+  const longPressTimer = useRef<NodeJS.Timeout | null>(null);
+
+  const cycleQuality = () => {
+    const qualities = ['128k', '192k', '320k'];
+    const next = qualities[(qualities.indexOf(audioQuality) + 1) % qualities.length];
+    setAudioQuality(next);
+    localStorage.setItem('v_to_a_quality', next);
+    showToast(`Quality set to ${next}`);
+  };
+
+  // ... (keeping existing logic) ...
+
   const startDownloadFromUrl = async (targetUrl: string) => {
     try {
       setStatus('fetching');
@@ -261,12 +273,13 @@ export default function App() {
       const convertRes = await fetch('/api/convert-youtube', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: targetUrl, format: 'mp3', customName: videoTitle }),
+        body: JSON.stringify({ url: targetUrl, format: 'mp3', customName: videoTitle, bitrate: audioQuality }),
       });
       const { ok, jobId, error } = await convertRes.json();
       if (!ok) throw new Error(error || 'কনভার্ট শুরু করা যায়নি।');
 
       // 3. SSE Progress tracking
+      // ... (rest is unchanged)
       const eventSource = new EventSource(`/api/convert-progress/${jobId}`);
       
       const progressPromise = new Promise<any>((resolve, reject) => {
@@ -341,6 +354,7 @@ export default function App() {
       const formData = new FormData();
       formData.append('video', file);
       formData.append('format', 'mp3');
+      formData.append('bitrate', audioQuality);
 
       let currentP = 15;
       const progressTimer = setInterval(() => {
@@ -514,7 +528,7 @@ export default function App() {
       />
 
       {/* TOP HEADER - 'V to A' & 'FAKE DEVELOPER' */}
-      <header className="w-full pt-6 sm:pt-12 pb-2 flex flex-col items-center justify-center z-10 flex-shrink-0">
+      <header className="w-full pt-12 sm:pt-16 pb-2 flex flex-col items-center justify-center z-10 flex-shrink-0">
         <h1 className="text-3xl sm:text-4xl font-light tracking-[0.28em] text-white uppercase transition-all duration-300 drop-shadow-sm">
           V to A
         </h1>
@@ -524,7 +538,7 @@ export default function App() {
       </header>
 
       {/* CENTER SLEEK CIRCULAR BUTTON (CLEAN SURFACE, NO DOWNLOAD ICON, BOBS UP & DOWN WHEN DOWNLOADING) */}
-      <main className="flex-1 w-full max-w-md flex flex-col items-center justify-center my-auto z-10 px-4">
+      <main className="flex-1 w-full max-w-md flex flex-col items-center justify-start mt-12 sm:mt-16 my-auto z-10 px-4">
         <div
           className={`relative flex flex-col items-center justify-center transition-transform ${
             isDownloadingOrFetching ? 'animate-bob' : ''
@@ -641,6 +655,15 @@ export default function App() {
       <footer className="w-full pb-5 sm:pb-8 pt-2 flex flex-col items-center justify-center z-10 flex-shrink-0">
         <button
           onClick={() => setShowAudiosDrawer(true)}
+          onPointerDown={() => {
+            longPressTimer.current = setTimeout(cycleQuality, 600);
+          }}
+          onPointerUp={() => {
+            if (longPressTimer.current) clearTimeout(longPressTimer.current);
+          }}
+          onPointerLeave={() => {
+            if (longPressTimer.current) clearTimeout(longPressTimer.current);
+          }}
           className="group flex items-center gap-2.5 text-[#9ba0b1] hover:text-white transition-all duration-300 py-2.5 px-6 rounded-full hover:bg-white/[0.06] active:scale-95 cursor-pointer touch-manipulation"
         >
           <DotMatrixIcon className="w-4 h-4 text-[#7d8293] group-hover:text-white transition-colors duration-300" />
