@@ -261,7 +261,7 @@ export default function App() {
       let videoTitle = 'audio-track';
       let estimatedSize = 4.5;
       try {
-        const infoRes = await fetch(`/api/youtube-info?url=${encodeURIComponent(targetUrl)}`, { signal: AbortSignal.timeout(6000) });
+        const infoRes = await fetch(`/api/youtube-info?url=${encodeURIComponent(targetUrl)}`, { signal: AbortSignal.timeout(9000) });
         if (infoRes.ok) {
           let infoData: YouTubeInfo;
           try {
