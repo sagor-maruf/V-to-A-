@@ -2,12 +2,12 @@ import React, { useState, useRef, useEffect } from 'react';
 import {
   Play,
   Pause,
-  Trash2,
   X,
   Upload,
   Music,
   Download,
 } from 'lucide-react';
+import { saveAudio, getAudio, hasAudio } from './utils/audioStorage.ts';
 import { decodeVideoFile, encodeAudioBufferToMp3, encodeAudioBufferToWav } from './utils/audioEncoder.ts';
 
 interface HistoryItem {
@@ -20,6 +20,7 @@ interface HistoryItem {
   format: string;
   duration?: number;
   timestamp: number;
+  storedLocally?: boolean; // NEW: ডিভাইসের স্টোরেজে কপি আছে কি না
 }
 
 interface YouTubeInfo {
@@ -107,6 +108,12 @@ export default function App() {
   // Hidden file input for uploading local video
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
+  // NEW: ডিভাইস স্টোর + অটো-নেক্সট প্লেয়ার + মেমরি ক্যাশের রেফ
+  const historyRef = useRef<HistoryItem[]>([]);
+  const playingIdRef = useRef<string | null>(null);
+  const togglePlayRef = useRef<(item: HistoryItem) => void>(() => {});
+  const blobUrlCache = useRef<Map<string, string>>(new Map());
+
   // Persist history on change
   useEffect(() => {
     try {
@@ -114,14 +121,76 @@ export default function App() {
     } catch {}
   }, [history]);
 
-  // Audio playback event listeners
+  // stale closure এড়াতে রেফ সিঙ্ক (অটো-নেক্সটের জন্য)
+  useEffect(() => {
+    historyRef.current = history;
+  }, [history]);
+  useEffect(() => {
+    playingIdRef.current = playingId;
+  }, [playingId]);
+
+  // DEVICE FIX: একবারই চলে — পুরনো ইতিহাসের গানগুলো ডিভাইস স্টোরেজে কপি করে আনি,
+  // আর যেগুলো আর কোথাও নেই (মৃত এন্ট্রি) তালিকা থেকে বাদ দিই।
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const stored = JSON.parse(localStorage.getItem('v_to_a_history') || '[]') as HistoryItem[];
+        if (!stored.length) return;
+        const aliveIds = new Set<string>();
+        for (const item of stored) {
+          if (await hasAudio(item.id)) {
+            aliveIds.add(item.id);
+            continue;
+          }
+          const url =
+            item.downloadUrl && !item.downloadUrl.startsWith('blob:')
+              ? item.downloadUrl
+              : item.streamUrl && !item.streamUrl.startsWith('blob:')
+                ? item.streamUrl
+                : null;
+          if (url) {
+            try {
+              const res = await fetch(url);
+              if (res.ok) {
+                const blob = await res.blob();
+                if (blob.size > 0 && (await saveAudio(item.id, item.fileName, blob.type || 'audio/mpeg', blob))) {
+                  aliveIds.add(item.id);
+                }
+              }
+            } catch {}
+          }
+        }
+        if (cancelled) return;
+        const storedIds = new Set(stored.map((x) => x.id));
+        setHistory((prev) =>
+          prev
+            .filter((item) => aliveIds.has(item.id) || !storedIds.has(item.id))
+            .map((item) => (aliveIds.has(item.id) ? { ...item, storedLocally: true } : item))
+        );
+      } catch {}
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Audio playback event listeners — এক গান শেষ হলে পরেরটা অটোমেটিক চালু হবে
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
 
     const handleEnded = () => {
-      setIsPlaying(false);
-      setPlayingId(null);
+      const curId = playingIdRef.current;
+      const list = historyRef.current;
+      const idx = curId ? list.findIndex((h) => h.id === curId) : -1;
+      const next = idx >= 0 && idx + 1 < list.length ? list[idx + 1] : null;
+      if (next) {
+        togglePlayRef.current(next); // AUTO-NEXT
+      } else {
+        setIsPlaying(false);
+        setPlayingId(null);
+      }
     };
     const handlePause = () => {
       setIsPlaying(false);
@@ -185,6 +254,10 @@ export default function App() {
         return;
       }
 
+      // SAFETY FIX: খালি/ব্লব-ডেড URL-এ ক্লিক করলে পেজ রিলোড হয়ে HTML ফাইল নামত —
+      // তাই এখন URL না থাকলে কিছুই করা হয় না (পপআপ/ভুল ফাইল দুটোই বন্ধ)।
+      if (!downloadUrl || downloadUrl.startsWith('blob:')) return;
+
       const a = document.createElement('a');
       a.href = downloadUrl;
       a.download = fileName;
@@ -194,6 +267,56 @@ export default function App() {
     } catch (err) {
       console.error('Auto download trigger failed:', err);
     }
+  };
+
+  // DEVICE FIX: ডাউনলোড হওয়া অডিও ডিভাইস স্টোরেজে (IndexedDB) রাখি + সাইলেন্টলি
+  // ফোনের Downloads/Files-এ সেভ করি — কোনো popup/fullscreen preview ছাড়াই।
+  const downloadAndStore = async (fileId: string, downloadUrl: string, fileName: string): Promise<boolean> => {
+    try {
+      const res = await fetch(downloadUrl);
+      if (!res.ok) return false;
+      const blob = await res.blob();
+      if (!blob.size) return false;
+      const mime = blob.type || 'audio/mpeg';
+      const ok = await saveAudio(fileId, fileName, mime, blob);
+      if (ok) {
+        const url = URL.createObjectURL(blob);
+        const old = blobUrlCache.current.get(fileId);
+        if (old) URL.revokeObjectURL(old);
+        blobUrlCache.current.set(fileId, url);
+        // সাইলেন্ট সেভ — ব্লব থেকে, তাই কখনোই HTML পেজ খুলবে না
+        triggerAutoDownload('', fileName, blob);
+      }
+      return ok;
+    } catch (err) {
+      console.warn('Local store failed, keeping server link:', err);
+      return false;
+    }
+  };
+
+  // প্লে করার URL: আগে ডিভাইস স্টোরেজ (স্থায়ী) → তারপর পুরনো সার্ভার লিংক
+  const resolvePlayableUrl = async (item: HistoryItem): Promise<string | null> => {
+    const cached = blobUrlCache.current.get(item.id);
+    if (cached) return cached;
+    const stored = await getAudio(item.id);
+    if (stored) {
+      const url = URL.createObjectURL(stored.blob);
+      blobUrlCache.current.set(item.id, url);
+      return url;
+    }
+    if (item.streamUrl && !item.streamUrl.startsWith('blob:')) return item.streamUrl;
+    if (item.downloadUrl && !item.downloadUrl.startsWith('blob:')) return item.downloadUrl;
+    return null;
+  };
+
+  // তালিকার ডাউনলোড বাটন — ডিভাইস কপি থেকে সাইলেন্ট সেভ
+  const handleSaveToDevice = async (item: HistoryItem) => {
+    const stored = await getAudio(item.id);
+    if (stored) {
+      triggerAutoDownload('', stored.fileName || item.fileName, stored.blob);
+      return;
+    }
+    triggerAutoDownload(item.downloadUrl, item.fileName);
   };
 
   // Handle clicking the central circular button
@@ -237,17 +360,6 @@ export default function App() {
     }
   };
 
-  const [audioQuality, setAudioQuality] = useState<string>(() => localStorage.getItem('v_to_a_quality') || '320k');
-  const longPressTimer = useRef<NodeJS.Timeout | null>(null);
-
-  const cycleQuality = () => {
-    const qualities = ['128k', '192k', '320k'];
-    const next = qualities[(qualities.indexOf(audioQuality) + 1) % qualities.length];
-    setAudioQuality(next);
-    localStorage.setItem('v_to_a_quality', next);
-    showToast(`Quality set to ${next}`);
-  };
-
   // ... (keeping existing logic) ...
 
   const startDownloadFromUrl = async (targetUrl: string) => {
@@ -283,7 +395,7 @@ export default function App() {
       const convertRes = await fetch('/api/convert-video', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: targetUrl, format: 'mp3', customName: videoTitle, bitrate: audioQuality }),
+        body: JSON.stringify({ url: targetUrl, format: 'mp3', customName: videoTitle, bitrate: '320k' }),
       });
       let convertResult;
       try {
@@ -328,8 +440,9 @@ export default function App() {
       if (document.visibilityState === 'hidden') {
         showNotification('Download Completed!', `${videoTitle} is ready.`);
       }
-      triggerAutoDownload(convertData.downloadUrl, convertData.fileName);
-      
+      // DEVICE + SILENT SAVE: ডিভাইসে কপি রাখি + ফোনের Files/Downloads-এ পপআপ ছাড়া সেভ
+      const storedLocally = await downloadAndStore(convertData.fileId, convertData.downloadUrl, convertData.fileName);
+
       // Add to history
       const newHistoryItem: HistoryItem = {
         id: convertData.fileId,
@@ -341,6 +454,7 @@ export default function App() {
         format: 'MP3 320kbps',
         duration: convertData.duration,
         timestamp: Date.now(),
+        storedLocally,
       };
       setHistory((prev) => [newHistoryItem, ...prev.filter((i) => i.id !== newHistoryItem.id)]);
       
@@ -370,7 +484,7 @@ export default function App() {
       const formData = new FormData();
       formData.append('video', file);
       formData.append('format', 'mp3');
-      formData.append('bitrate', audioQuality);
+      formData.append('bitrate', '320k');
 
       let currentP = 15;
       const progressTimer = setInterval(() => {
@@ -397,7 +511,7 @@ export default function App() {
           setProgressPercent(100);
           setStatus('completed');
 
-          triggerAutoDownload(data.downloadUrl, data.fileName);
+          const storedLocally = await downloadAndStore(data.fileId, data.downloadUrl, data.fileName);
 
           const newHistoryItem: HistoryItem = {
             id: data.fileId,
@@ -408,6 +522,7 @@ export default function App() {
             fileSize: finalSize,
             format: 'MP3 320kbps',
             timestamp: Date.now(),
+            storedLocally,
           };
           setHistory((prev) => [newHistoryItem, ...prev.filter((i) => i.id !== newHistoryItem.id)]);
 
@@ -430,17 +545,22 @@ export default function App() {
       const outName = `${file.name.replace(/\.[^/.]+$/, '')}.mp3`;
       triggerAutoDownload('', outName, mp3Blob);
 
+      // DEVICE FIX: ইনকোড করা অডিওটাও ডিভাইস স্টোরেজে রাখি (রিলোডের পরেও চলবে)
+      const localId = `${Date.now()}`;
+      const storedOk = await saveAudio(localId, outName, 'audio/mpeg', mp3Blob);
       const localBlobUrl = URL.createObjectURL(mp3Blob);
+      blobUrlCache.current.set(localId, localBlobUrl);
       const newHistoryItem: HistoryItem = {
-        id: `${Date.now()}`,
+        id: localId,
         title: file.name.replace(/\.[^/.]+$/, ''),
         fileName: outName,
-        downloadUrl: localBlobUrl,
-        streamUrl: localBlobUrl,
+        downloadUrl: '',
+        streamUrl: '',
         fileSize: mp3Blob.size,
         format: 'MP3 320kbps',
         duration: audioBuffer.duration,
         timestamp: Date.now(),
+        storedLocally: storedOk,
       };
       setHistory((prev) => [newHistoryItem, ...prev.filter((i) => i.id !== newHistoryItem.id)]);
 
@@ -456,57 +576,55 @@ export default function App() {
     }
   };
 
-  // Audio preview playback in drawer
-  const togglePlayAudio = (item: HistoryItem) => {
+  // Audio playback in drawer — ডিভাইস স্টোরেজ থেকে চলে; এক গান শেষ → পরেরটা অটো
+  const togglePlayAudio = async (item: HistoryItem) => {
     const audio = audioRef.current;
     if (!audio) return;
 
     if (playingId === item.id && isPlaying) {
       audio.pause();
       setIsPlaying(false);
-    } else {
-      audio.src = item.streamUrl || item.downloadUrl;
-      audio
-        .play()
-        .then(() => {
-          setPlayingId(item.id);
-          setIsPlaying(true);
-          
-          // Media Session API for background control
-          if ('mediaSession' in navigator) {
-            navigator.mediaSession.metadata = new MediaMetadata({
-              title: item.title,
-              artist: 'V to A App',
-            });
-            navigator.mediaSession.setActionHandler('play', () => audio.play());
-            navigator.mediaSession.setActionHandler('pause', () => audio.pause());
-          }
-        })
-        .catch((e) => {
-          console.error('Audio play error:', e);
-          window.open(item.downloadUrl, '_blank');
+      return;
+    }
+
+    const url = await resolvePlayableUrl(item);
+
+    // FIX: আগে এখানে window.open() ছিল — সেটাই iOS-এ ফুলস্ক্রিন HTML পেজ খুলত!
+    if (!url) {
+      showToast('এই অডিওটি আর পাওয়া যাচ্ছে না।');
+      return;
+    }
+
+    audio.src = url;
+    try {
+      await audio.play();
+      setPlayingId(item.id);
+      setIsPlaying(true);
+
+      // Media Session API for background control
+      if ('mediaSession' in navigator) {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: item.title,
+          artist: 'V to A App',
         });
+        navigator.mediaSession.setActionHandler('play', () => audio.play());
+        navigator.mediaSession.setActionHandler('pause', () => audio.pause());
+        try {
+          navigator.mediaSession.setActionHandler('nexttrack', () => {
+            const list = historyRef.current;
+            const idx = list.findIndex((h) => h.id === item.id);
+            if (idx >= 0 && idx + 1 < list.length) togglePlayRef.current(list[idx + 1]);
+          });
+        } catch {}
+      }
+    } catch (e) {
+      console.error('Audio play error:', e);
+      showToast('অডিও চালু করা যায়নি।');
     }
   };
 
-  const deleteHistoryItem = (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (playingId === id && audioRef.current) {
-      audioRef.current.pause();
-      setIsPlaying(false);
-      setPlayingId(null);
-    }
-    setHistory((prev) => prev.filter((item) => item.id !== id));
-  };
-
-  const clearAllHistory = () => {
-    if (audioRef.current) {
-      audioRef.current.pause();
-      setIsPlaying(false);
-      setPlayingId(null);
-    }
-    setHistory([]);
-  };
+  // অটো-নেক্সটের জন্য রেফ হালনাগাদ
+  togglePlayRef.current = togglePlayAudio;
 
   const formatBytes = (bytes: number) => {
     if (!bytes || bytes === 0) return '0 MB';
@@ -681,15 +799,6 @@ export default function App() {
       <footer className="w-full pb-5 sm:pb-8 pt-2 flex flex-col items-center justify-center z-10 flex-shrink-0">
         <button
           onClick={() => setShowAudiosDrawer(true)}
-          onPointerDown={() => {
-            longPressTimer.current = setTimeout(cycleQuality, 600);
-          }}
-          onPointerUp={() => {
-            if (longPressTimer.current) clearTimeout(longPressTimer.current);
-          }}
-          onPointerLeave={() => {
-            if (longPressTimer.current) clearTimeout(longPressTimer.current);
-          }}
           className="group flex flex-col items-center gap-2 text-[#d4af37] hover:text-white transition-all duration-300 py-2.5 px-6 rounded-full hover:bg-white/[0.06] active:scale-95 cursor-pointer touch-manipulation"
         >
           <DotMatrixIcon className="w-8 h-8 text-[#d4af37] group-hover:text-white transition-colors duration-300" />
@@ -728,14 +837,6 @@ export default function App() {
               </div>
 
               <div className="flex items-center gap-2">
-                {history.length > 0 && (
-                  <button
-                    onClick={clearAllHistory}
-                    className="text-[11px] text-[#8e92a2] hover:text-white px-2.5 py-1 rounded-md transition-colors cursor-pointer"
-                  >
-                    Clear All
-                  </button>
-                )}
                 <button
                   onClick={() => setShowAudiosDrawer(false)}
                   className="p-1.5 text-[#8e92a2] hover:text-white rounded-full hover:bg-white/[0.08] transition-colors cursor-pointer"
@@ -800,23 +901,15 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* Action buttons */}
+                    {/* Action buttons — ডিভাইস কপি থেকে সাইলেন্ট সেভ (popup নেই) */}
                     <div className="flex items-center gap-1">
                       <button
-                        onClick={() => triggerAutoDownload(item.downloadUrl, item.fileName)}
+                        onClick={() => handleSaveToDevice(item)}
                         className="p-2 text-[#7d8293] hover:text-white rounded-lg hover:bg-white/[0.08] transition-colors cursor-pointer"
-                        title="Download again"
-                        aria-label="Download again"
+                        title="Save to device"
+                        aria-label="Save to device"
                       >
                         <Download className="w-4 h-4 stroke-[1.5]" />
-                      </button>
-                      <button
-                        onClick={(e) => deleteHistoryItem(item.id, e)}
-                        className="p-2 text-[#727685] hover:text-[#ff7878] rounded-lg hover:bg-white/[0.08] transition-colors cursor-pointer"
-                        title="Delete from history"
-                        aria-label="Delete"
-                      >
-                        <Trash2 className="w-4 h-4 stroke-[1.5]" />
                       </button>
                     </div>
                   </div>
