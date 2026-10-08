@@ -54,16 +54,28 @@ function DotMatrixIcon({ className = 'w-4 h-4' }: { className?: string }) {
 function extractUrlFromString(text: string): string | null {
   if (!text) return null;
   const trimmed = text.trim();
-  // Exact 11-char YouTube ID
+  
+  // YouTube 11-char ID
   if (/^[a-zA-Z0-9_-]{11}$/.test(trimmed)) {
     return `https://www.youtube.com/watch?v=${trimmed}`;
   }
-  // Standard URL pattern
+
+  // General URL validation for supported platforms
+  const supportedDomains = [
+    'youtube.com', 'youtu.be', 
+    'facebook.com', 'fb.watch', 
+    'tiktok.com', 
+    'instagram.com'
+  ];
+
   const match = trimmed.match(/(https?:\/\/[^\s]+)/i);
-  if (match) return match[1];
-  if (trimmed.includes('youtube.com') || trimmed.includes('youtu.be')) {
-    return `https://${trimmed.replace(/^https?:\/\//, '')}`;
+  if (match) {
+    const url = match[1];
+    if (supportedDomains.some(domain => url.includes(domain))) {
+      return url;
+    }
   }
+
   return null;
 }
 
@@ -263,7 +275,7 @@ export default function App() {
 
       // 2. Request conversion (Async)
       setStatus('downloading');
-      const convertRes = await fetch('/api/convert-youtube', {
+      const convertRes = await fetch('/api/convert-video', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: targetUrl, format: 'mp3', customName: videoTitle, bitrate: audioQuality }),
@@ -521,17 +533,17 @@ export default function App() {
       />
 
       {/* TOP HEADER - 'V to A' & 'FAKE DEVELOPER' */}
-      <header className="w-full pt-12 sm:pt-16 pb-2 flex flex-col items-center justify-center z-10 flex-shrink-0">
-        <h1 className="text-3xl sm:text-4xl font-light tracking-[0.28em] text-white uppercase transition-all duration-300 drop-shadow-sm">
+      <header className="w-full pt-16 sm:pt-20 pb-2 flex flex-col items-center justify-center z-10 flex-shrink-0">
+        <h1 className="text-xl sm:text-2xl font-light tracking-[0.2em] text-white uppercase transition-all duration-300 drop-shadow-sm">
           V to A
         </h1>
-        <p className="text-[10px] sm:text-xs font-medium tracking-[0.35em] text-[#8e92a2] uppercase mt-2">
+        <p className="text-[8px] sm:text-[10px] font-medium tracking-[0.4em] text-[#8e92a2] uppercase mt-2">
           FAKE DEVELOPER
         </p>
       </header>
 
-      {/* CENTER SLEEK CIRCULAR BUTTON (CLEAN SURFACE, NO DOWNLOAD ICON, BOBS UP & DOWN WHEN DOWNLOADING) */}
-      <main className="flex-1 w-full max-w-md flex flex-col items-center justify-start mt-12 sm:mt-16 my-auto z-10 px-4">
+      {/* CENTER SLEEK CIRCULAR BUTTON */}
+      <main className="flex-1 w-full max-w-md flex flex-col items-center justify-center z-10 px-4">
         <div
           className={`relative flex flex-col items-center justify-center transition-transform ${
             isDownloadingOrFetching ? 'animate-bob' : ''
@@ -541,19 +553,19 @@ export default function App() {
           <div
             className={`absolute rounded-full transition-all duration-700 pointer-events-none ${
               isDownloadingOrFetching
-                ? 'w-64 h-64 sm:w-72 sm:h-72 bg-white/12 blur-2xl'
+                ? 'w-48 h-48 sm:w-56 sm:h-56 bg-white/10 blur-2xl'
                 : status === 'completed'
-                ? 'w-64 h-64 sm:w-72 sm:h-72 bg-white/18 blur-2xl'
-                : 'w-56 h-56 sm:w-64 sm:h-64 bg-white/[0.05] blur-xl'
+                ? 'w-48 h-48 sm:w-56 sm:h-56 bg-white/15 blur-2xl'
+                : 'w-40 h-40 sm:w-48 sm:h-48 bg-white/[0.03] blur-xl'
             }`}
           />
 
-          {/* Clean Tactile Metallic Circular Button (Matching IMG_7043, icon-free) */}
+          {/* Clean Tactile Metallic Circular Button */}
           <button
             onClick={handleCircleClick}
             disabled={status === 'fetching' || status === 'downloading'}
             aria-label="Download copied video link"
-            className={`group relative w-52 h-52 sm:w-60 sm:h-60 md:w-64 md:h-64 rounded-full p-[2.5px] sm:p-[3px] metallic-chrome-outer transition-all duration-300 active:scale-95 cursor-pointer select-none ${
+            className={`group relative w-40 h-40 sm:w-48 sm:h-48 rounded-full p-[2px] metallic-chrome-outer transition-all duration-300 active:scale-95 cursor-pointer select-none ${
               isDownloadingOrFetching
                 ? 'brightness-110'
                 : 'hover:brightness-110'

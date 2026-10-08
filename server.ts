@@ -6,8 +6,6 @@ import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
 import { pipeline } from 'stream/promises';
 import multer from 'multer';
-import ytdl from '@distube/ytdl-core';
-import ffmpegStatic from 'ffmpeg-static';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -219,14 +217,23 @@ function sanitizeFilename(name: string): string {
   );
 }
 
-function extractYouTubeId(url: string): string | null {
-  if (!url) return null;
+function extractVideoId(url: string): { platform: string; id: string | null; url: string } {
+  if (!url) return { platform: 'unknown', id: null, url };
   const trimmed = url.trim();
-  if (/^[a-zA-Z0-9_-]{11}$/.test(trimmed)) return trimmed;
-  const match = trimmed.match(
-    /(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|shorts\/|live\/|watch\?.+&v=))([\w-]{11})/i
-  );
-  return match ? match[1] : null;
+  
+  // Detect platform
+  if (trimmed.includes('youtube.com') || trimmed.includes('youtu.be')) {
+    const match = trimmed.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|shorts\/|live\/|watch\?.+&v=))([\w-]{11})/i);
+    return { platform: 'youtube', id: match ? match[1] : null, url: trimmed };
+  } else if (trimmed.includes('facebook.com') || trimmed.includes('fb.watch')) {
+    return { platform: 'facebook', id: trimmed, url: trimmed };
+  } else if (trimmed.includes('tiktok.com')) {
+    return { platform: 'tiktok', id: trimmed, url: trimmed };
+  } else if (trimmed.includes('instagram.com')) {
+    return { platform: 'instagram', id: trimmed, url: trimmed };
+  }
+  
+  return { platform: 'unknown', id: null, url: trimmed };
 }
 
 const BROWSER_UA =
@@ -558,83 +565,103 @@ app.get('/api/youtube-info', async (req, res) => {
   }
 });
 
-// 2. Convert YouTube to Audio (Async)
-app.post('/api/convert-youtube', async (req, res) => {
-  const { url, format = 'mp3', customName, bitrate = '320k' } = req.body;
-  if (!url) return res.status(400).json({ ok: false, error: 'ইউটিউব লিঙ্ক আবশ্যক।' });
+// 2. Convert YouTube/Social Media to Audio (Async)
+app.post('/api/convert-video', async (req, res) => {
+  const { url, format = 'mp3', customName, bitrate } = req.body;
+  if (!url) return res.status(400).json({ ok: false, error: 'লিঙ্ক আবশ্যক।' });
 
-  const videoId = extractYouTubeId(url);
-  if (!videoId) return res.status(400).json({ ok: false, error: 'সঠিক ইউটিউব লিঙ্ক পাওয়া যায়নি।' });
+  const videoInfo = extractVideoId(url);
+  if (!videoInfo.url) return res.status(400).json({ ok: false, error: 'সঠিক লিঙ্ক পাওয়া যায়নি।' });
+
+  if (videoInfo.platform !== 'youtube') {
+    return res.status(501).json({ ok: false, error: `${videoInfo.platform} বর্তমানে সাপোর্ট করে না। শুধুমাত্র ইউটিউব সাপোর্ট করে।` });
+  }
 
   const jobId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
   jobRegistry.set(jobId, { status: 'pending', progress: 0 });
 
-  res.json({ ok: true, jobId });
-
+  // Run conversion in background
   (async () => {
     try {
       jobRegistry.set(jobId, { status: 'downloading', progress: 10 });
-      const requestOptions = {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-          'Referer': 'https://www.youtube.com/',
-          'Accept-Language': 'en-US,en;q=0.9',
-        },
-      };
-      const info = await ytdl.getInfo(url, requestOptions);
-      const videoTitle = info.videoDetails.title;
+      // 1. Fetch title
+      let videoTitle = 'audio-track';
+      try {
+        const oembed = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoInfo.id}&format=json`, { signal: AbortSignal.timeout(3000) });
+        if (oembed.ok) {
+          const d = await oembed.json();
+          if (d.title) videoTitle = d.title;
+        }
+      } catch {}
 
       const targetFormat = format && format !== 'auto' ? format.toLowerCase() : 'mp3';
-      const fmtDetails = getFormatDetails(targetFormat, bitrate);
-      const baseName = sanitizeFilename(customName || videoTitle);
+      const fmtDetails = getFormatDetails(targetFormat);
+      const baseName = sanitizeFilename(customName || videoTitle || 'video-audio');
       const finalFilename = `${baseName}${fmtDetails.ext}`;
-      const outputFilePath = path.join(OUTPUTS_DIR, `${jobId}${fmtDetails.ext}`);
+      const fileId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+      const outputFilePath = path.join(OUTPUTS_DIR, `${fileId}${fmtDetails.ext}`);
 
-      jobRegistry.set(jobId, { status: 'extracting', progress: 30 });
+      jobRegistry.set(jobId, { status: 'downloading', progress: 30 });
+      // Fetch or reuse master audio stream
+      const masterResult = await fetchMasterAudioForVideo(videoInfo.id!);
+
+      if (!masterResult.success || !masterResult.cachedPath || !fs.existsSync(masterResult.cachedPath)) {
+        jobRegistry.set(jobId, { status: 'error', progress: 0, error: 'ইউটিউব ভিডিও থেকে অডিও পাওয়া যায়নি।' });
+        return;
+      }
+
+      jobRegistry.set(jobId, { status: 'extracting', progress: 60 });
+      const qualityAnalysis = await analyzeMediaQuality(masterResult.cachedPath);
+      const targetBitrate = bitrate || qualityAnalysis.recommendedBitrate || '320k';
       
-      const audioStream = ytdl(url, { ...requestOptions, quality: 'highestaudio', filter: 'audioonly' });
+      jobRegistry.set(jobId, { status: 'finalizing', progress: 85 });
+      const transcodeOk = await transcodeAudioFile(
+        masterResult.cachedPath,
+        targetFormat,
+        outputFilePath,
+        targetBitrate
+      );
 
-      const ffmpegProcess = spawn(ffmpegStatic || '/usr/bin/ffmpeg', [
-        '-i', 'pipe:0',
-        ...fmtDetails.ffmpegArgs,
-        '-y', outputFilePath
-      ]);
+      if (!transcodeOk || !fs.existsSync(outputFilePath)) {
+        jobRegistry.set(jobId, { status: 'error', progress: 0, error: 'অডিও ট্রান্সকোডিং ব্যর্থ হয়েছে।' });
+        return;
+      }
 
-      audioStream.pipe(ffmpegProcess.stdin);
+      const stat = fs.statSync(outputFilePath);
+      const exactDuration = await getAudioDurationSeconds(outputFilePath);
 
-      ffmpegProcess.on('close', async (code) => {
-        if (code === 0 && fs.existsSync(outputFilePath)) {
-          const stat = fs.statSync(outputFilePath);
-          fileRegistry.set(jobId, {
-            id: jobId,
-            filePath: outputFilePath,
-            fileName: finalFilename,
-            format: targetFormat,
-            mimeType: fmtDetails.mimeType,
-            fileSize: stat.size,
-            createdAt: Date.now(),
-          });
-          jobRegistry.set(jobId, { 
-            status: 'completed', 
-            progress: 100,
-            result: {
-              fileId: jobId,
-              fileName: finalFilename,
-              format: targetFormat.toUpperCase(),
-              fileSize: stat.size,
-              downloadUrl: `/api/download/${jobId}`,
-              streamUrl: `/api/stream/${jobId}`,
-            }
-          });
-        } else {
-          jobRegistry.set(jobId, { status: 'error', progress: 0, error: 'অডিও ট্রান্সকোডিং ব্যর্থ হয়েছে।' });
+      const record: AudioFileRecord = {
+        id: fileId,
+        filePath: outputFilePath,
+        fileName: finalFilename,
+        format: targetFormat,
+        mimeType: fmtDetails.mimeType,
+        fileSize: stat.size,
+        duration: exactDuration || undefined,
+        createdAt: Date.now(),
+      };
+      fileRegistry.set(fileId, record);
+
+      jobRegistry.set(jobId, { 
+        status: 'completed', 
+        progress: 100,
+        result: {
+          fileId,
+          fileName: finalFilename,
+          format: targetFormat.toUpperCase(),
+          fileSize: stat.size,
+          duration: exactDuration,
+          downloadUrl: `/api/download/${fileId}`,
+          streamUrl: `/api/stream/${fileId}`,
         }
       });
     } catch (error: any) {
-      console.error('Streaming conversion error:', error);
+      console.error('Convert video background error:', error);
       jobRegistry.set(jobId, { status: 'error', progress: 0, error: error.message || 'কনভার্ট ব্যর্থ হয়েছে।' });
     }
   })();
+
+  return res.json({ ok: true, jobId });
 });
 
 // 3. Convert uploaded video file to audio
