@@ -1,8 +1,11 @@
 # Base image
 FROM node:20-slim
 
-# Install ffmpeg
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+# Install ffmpeg (অডিও কনভার্সন) + curl (yt-dlp নামানোর জন্য)
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg curl ca-certificates && rm -rf /var/lib/apt/lists/*
+
+# Install yt-dlp — Facebook / TikTok / Instagram ডাউনলোড ইঞ্জিন
+RUN curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux -o /usr/local/bin/yt-dlp && chmod +x /usr/local/bin/yt-dlp && yt-dlp --version
 
 # Set working directory
 WORKDIR /app
