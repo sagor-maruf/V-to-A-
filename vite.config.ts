@@ -14,6 +14,11 @@ export default defineConfig(() => {
         devOptions: {
           enabled: false,
         },
+        workbox: {
+          // FIX: সার্ভিস ওয়ার্কার যেন /api/ লিংকে অ্যাপের index.html সার্ভ না করে।
+          // (এটার কারণেই MP3 ডাউনলোড করতে গেলে "audio-track.mp3.html" নামে HTML ফাইল নামত!)
+          navigateFallbackDenylist: [/^\/api\//],
+        },
         includeAssets: ['favicon.svg', 'apple-touch-icon.png', 'icon.svg'],
         manifest: {
           id: '/',
