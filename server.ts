@@ -477,13 +477,24 @@ function setupYtDlpCookies(): string | null {
 }
 
 function ytDlpBaseArgs(withImpersonate: boolean): string[] {
-  const args = ['--no-warnings', '--no-playlist', '--no-part', '--retries', '3', '--max-filesize', '400M'];
+  const args = [
+    '--no-warnings',
+    '--no-playlist',
+    '--no-part',
+    '--retries', '3',
+    '--concurrent-fragments', '5',   // SPEED FIX: ৫টা প্যারালাল কানেকশনে ডাউনলোড (কয়েকগুণ দ্রুত)
+    '--max-filesize', '400M',
+  ];
   if (withImpersonate) args.push('--impersonate', 'chrome');
   if (YTDLP_COOKIE_FILE) args.push('--cookies', YTDLP_COOKIE_FILE);
   return args;
 }
 
-function runYtDlp(args: string[], timeoutMs: number): Promise<{ code: number; stdout: string; stderr: string }> {
+function runYtDlp(
+  args: string[],
+  timeoutMs: number,
+  onProgress?: (pct: number) => void
+): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
@@ -497,8 +508,17 @@ function runYtDlp(args: string[], timeoutMs: number): Promise<{ code: number; st
       }
     }, timeoutMs);
     proc.stdout.on('data', (d) => {
-      stdout += d.toString();
+      const chunk = d.toString();
+      stdout += chunk;
       if (stdout.length > 200000) stdout = stdout.slice(-200000);
+      // লাইভ ডাউনলোড % — প্রগ্রেস বারে দেখানোর জন্য
+      if (onProgress) {
+        const matches = chunk.match(/(\d{1,3}(?:\.\d+)?)%/g);
+        if (matches && matches.length) {
+          const pct = parseFloat(matches[matches.length - 1]);
+          if (!isNaN(pct) && pct >= 0 && pct <= 100) onProgress(pct);
+        }
+      }
     });
     proc.stderr.on('data', (d) => {
       stderr += d.toString();
@@ -545,17 +565,25 @@ function friendlyYtDlpError(stderr: string): string {
 // Facebook / TikTok / Instagram থেকে অডিও (বা ভিডিও) ডাউনলোড + ক্যাশ
 async function fetchMasterAudioForYtDlp(
   platform: string,
-  url: string
+  url: string,
+  onProgress?: (pct: number) => void
 ): Promise<{ success: boolean; cachedPath?: string; title?: string; error?: string }> {
   const cacheKey = `ytdlp-${platform}-${createHash('md5').update(url).digest('hex').slice(0, 16)}`;
+  const metaPath = path.join(CACHE_DIR, `${cacheKey}.meta`);
 
-  // 1. ক্যাশে আগে থেকে থাকলে সেটাই দিই
+  // 1. ক্যাশে আগে থেকে থাকলে সেটাই দিই (টাইটেলসহ — ক্যাশে-হিটে নাম হারানোর বাগ ফিক্স)
   try {
-    const cachedFiles = fs.readdirSync(CACHE_DIR).filter((f) => f.startsWith(cacheKey + '.'));
+    const cachedFiles = fs
+      .readdirSync(CACHE_DIR)
+      .filter((f) => f.startsWith(cacheKey + '.') && !f.endsWith('.meta'));
     for (const f of cachedFiles) {
       const p = path.join(CACHE_DIR, f);
       if (fs.statSync(p).size > 1024) {
-        return { success: true, cachedPath: p };
+        let cachedTitle: string | undefined;
+        try {
+          cachedTitle = JSON.parse(fs.readFileSync(metaPath, 'utf8')).title || undefined;
+        } catch {}
+        return { success: true, cachedPath: p, title: cachedTitle };
       }
     }
   } catch {}
@@ -586,7 +614,7 @@ async function fetchMasterAudioForYtDlp(
         url,
       ];
 
-      const result = await runYtDlp(args, 330000);
+      const result = await runYtDlp(args, 330000, onProgress);
       const lines = result.stdout.split('\n').map((l) => l.trim()).filter(Boolean);
       let filePath: string | null = null;
       for (const line of lines) {
@@ -606,6 +634,9 @@ async function fetchMasterAudioForYtDlp(
         } catch {
           fs.copyFileSync(filePath, finalPath);
         }
+        try {
+          fs.writeFileSync(metaPath, JSON.stringify({ title }), 'utf8');
+        } catch {}
         try {
           fs.rmSync(tmpDir, { recursive: true, force: true });
         } catch {}
@@ -882,12 +913,28 @@ app.post('/api/convert-video', async (req, res, next) => {
       const fileId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
       const outputFilePath = path.join(OUTPUTS_DIR, `${fileId}${fmtDetails.ext}`);
 
-      jobRegistry.set(jobId, { status: 'downloading', progress: 30 });
-      // Fetch or reuse master audio stream (ইউটিউব = লোডার ইঞ্জিন | FB/TikTok/IG = yt-dlp)
-      const masterResult =
-        videoInfo.platform === 'youtube'
-          ? await fetchMasterAudioForVideo(videoInfo.id!)
-          : await fetchMasterAudioForYtDlp(videoInfo.platform, videoInfo.url);
+      jobRegistry.set(jobId, { status: 'downloading', progress: 15 });
+
+      // SPEED + QUALITY FIX:
+      // ইউটিউব → আগে yt-dlp (সরাসরি CDN থেকে ২-৩ সেকেন্ডে বেস্ট অডিও), ব্যর্থ হলে পুরনো loader.to ইঞ্জিন
+      // ফেসবুক/টিকটক/ইনস্টাগ্রাম → yt-dlp
+      const onYtDlpProgress = (pct: number) => {
+        const mapped = Math.min(15 + Math.round((pct / 100) * 45), 60); // 15% → 60%
+        jobRegistry.set(jobId, { status: 'downloading', progress: mapped });
+      };
+
+      let masterResult;
+      if (videoInfo.platform === 'youtube') {
+        const youtubeUrl = `https://www.youtube.com/watch?v=${videoInfo.id}`;
+        masterResult = await fetchMasterAudioForYtDlp('youtube', youtubeUrl, onYtDlpProgress);
+        if (!masterResult.success || !masterResult.cachedPath) {
+          console.warn('YouTube yt-dlp failed, falling back to loader engine:', masterResult.error);
+          jobRegistry.set(jobId, { status: 'downloading', progress: 30 });
+          masterResult = await fetchMasterAudioForVideo(videoInfo.id!);
+        }
+      } else {
+        masterResult = await fetchMasterAudioForYtDlp(videoInfo.platform, videoInfo.url, onYtDlpProgress);
+      }
 
       if (!masterResult.success || !masterResult.cachedPath || !fs.existsSync(masterResult.cachedPath)) {
         jobRegistry.set(jobId, {
