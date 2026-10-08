@@ -87,10 +87,6 @@ export default function App() {
     }
   });
 
-  // Manual fallback paste dialog (in case browser denies clipboard API access)
-  const [showManualPasteModal, setShowManualPasteModal] = useState(false);
-  const [manualUrlInput, setManualUrlInput] = useState('');
-
   // Audio player inside drawer
   const [playingId, setPlayingId] = useState<string | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -209,27 +205,24 @@ export default function App() {
     setErrorMessage(null);
 
     // Read clipboard URL automatically
-    let clipboardText = '';
     try {
       if (!navigator.clipboard || !navigator.clipboard.readText) {
         throw new Error('Clipboard API not available');
       }
-      clipboardText = await navigator.clipboard.readText();
+      const clipboardText = await navigator.clipboard.readText();
+
+      const cleanUrl = extractUrlFromString(clipboardText);
+      if (!cleanUrl) {
+        showToast('ক্লিপবোর্ডে কোনো লিঙ্ক নেই!');
+        return;
+      }
+
+      // Start conversion flow
+      startDownloadFromUrl(cleanUrl);
     } catch (err: any) {
       console.warn('Clipboard readText failed or restricted:', err);
-      // Open clean fallback prompt if browser blocked clipboard
-      setShowManualPasteModal(true);
-      return;
+      showToast('ক্লিপবোর্ড থেকে লিঙ্ক পড়া সম্ভব হয়নি।');
     }
-
-    const cleanUrl = extractUrlFromString(clipboardText);
-    if (!cleanUrl) {
-      showToast('ক্লিপবোর্ডে কোনো লিঙ্ক নেই! যেকোনো ভিডিওর লিঙ্ক কপি করে বৃত্তে চাপুন।');
-      return;
-    }
-
-    // Start conversion flow
-    startDownloadFromUrl(cleanUrl);
   };
 
   const [audioQuality, setAudioQuality] = useState<string>(() => localStorage.getItem('v_to_a_quality') || '320k');
@@ -678,6 +671,7 @@ export default function App() {
         </button>
       </footer>
 
+
       {/* AUDIOS DRAWER / LIST (DOWNLOADED HISTORY) */}
       {showAudiosDrawer && (
         <div
@@ -810,66 +804,6 @@ export default function App() {
       )}
 
       {/* MANUAL PASTE MODAL (FALLBACK IF BROWSER RESTRICTS CLIPBOARD READTEXT) */}
-      {showManualPasteModal && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-md px-4"
-          onClick={() => setShowManualPasteModal(false)}
-        >
-          <div
-            className="w-full max-w-sm bg-[#18191f] border border-[#2e313e] rounded-2xl p-6 flex flex-col shadow-2xl animate-in zoom-in-95 duration-200"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-sm font-medium tracking-wider uppercase text-[#d2d5e3]">
-                Paste Video Link
-              </h3>
-              <button
-                onClick={() => setShowManualPasteModal(false)}
-                className="text-[#7d8293] hover:text-white cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <p className="text-xs text-[#8e92a4] mb-4 font-light">
-              ব্রাউজার ক্লিপবোর্ড অনুমতি দেয়নি। লিঙ্কটি নিচে পেস্ট করে ডাউনলোড শুরু করুন:
-            </p>
-
-            <input
-              type="text"
-              value={manualUrlInput}
-              onChange={(e) => setManualUrlInput(e.target.value)}
-              placeholder="https://youtu.be/..."
-              autoFocus
-              className="w-full bg-[#121317] border border-[#2d303b] rounded-lg px-3 py-2.5 text-xs text-white placeholder-[#5a5d6e] focus:outline-none focus:border-[#4d5265] transition-colors font-mono mb-4"
-            />
-
-            <div className="flex gap-2">
-              <button
-                onClick={() => setShowManualPasteModal(false)}
-                className="flex-1 py-2 rounded-lg text-xs text-[#8e92a4] hover:text-white border border-[#2d303b] hover:bg-[#20222a] transition-colors cursor-pointer"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => {
-                  const url = extractUrlFromString(manualUrlInput);
-                  if (url) {
-                    setShowManualPasteModal(false);
-                    setManualUrlInput('');
-                    startDownloadFromUrl(url);
-                  } else {
-                    showToast('সঠিক লিঙ্ক পেস্ট করুন');
-                  }
-                }}
-                className="flex-1 py-2 rounded-lg text-xs font-medium text-black bg-white hover:bg-neutral-200 transition-colors cursor-pointer"
-              >
-                Download
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
