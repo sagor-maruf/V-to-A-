@@ -5,6 +5,7 @@ import os from 'os';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
 import { pipeline } from 'stream/promises';
+import { createHash } from 'crypto';
 import multer from 'multer';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -437,6 +438,269 @@ async function fetchMasterAudioForVideo(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Multi-Platform Downloader (Facebook / TikTok / Instagram) — yt-dlp ইঞ্জিন
+// ---------------------------------------------------------------------------
+
+const PLATFORM_NAMES: Record<string, string> = {
+  youtube: 'ইউটিউব',
+  facebook: 'ফেসবুক',
+  tiktok: 'টিকটক',
+  instagram: 'ইনস্টাগ্রাম',
+};
+
+const YTDLP_BIN = process.env.YTDLP_PATH || 'yt-dlp';
+
+// অপশনাল: ইনস্টাগ্রাম/ফেসবুক লগইন-ওয়াল চাইলে Render-এর Environment-এ
+// YTDLP_COOKIES সেট করুন (cookies.txt ফাইলের কনটেন্ট বা base64 করতে হবে — গাইড দেখুন)
+const YTDLP_COOKIE_FILE = setupYtDlpCookies();
+
+function setupYtDlpCookies(): string | null {
+  try {
+    const raw = (process.env.YTDLP_COOKIES || '').trim();
+    if (!raw) return null;
+    if (raw.startsWith('/') && fs.existsSync(raw)) return raw; // সরাসরি ফাইল-পাথ দেওয়া হলে
+    let content = raw.replace(/\\n/g, '\n');
+    if (!content.includes('\n') && !content.startsWith('# Netscape')) {
+      try {
+        const decoded = Buffer.from(content, 'base64').toString('utf8');
+        if (decoded.includes('\t') || decoded.startsWith('# Netscape')) content = decoded;
+      } catch {}
+    }
+    if (!content.includes('\t') && !content.startsWith('# Netscape')) return null;
+    const p = path.join(os.tmpdir(), 'ytdlp-cookies.txt');
+    fs.writeFileSync(p, content, 'utf8');
+    return p;
+  } catch {
+    return null;
+  }
+}
+
+function ytDlpBaseArgs(withImpersonate: boolean): string[] {
+  const args = ['--no-warnings', '--no-playlist', '--no-part', '--retries', '3', '--max-filesize', '400M'];
+  if (withImpersonate) args.push('--impersonate', 'chrome');
+  if (YTDLP_COOKIE_FILE) args.push('--cookies', YTDLP_COOKIE_FILE);
+  return args;
+}
+
+function runYtDlp(args: string[], timeoutMs: number): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    let done = false;
+    const proc = spawn(YTDLP_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const timer = setTimeout(() => {
+      if (!done) {
+        try {
+          proc.kill('SIGKILL');
+        } catch {}
+      }
+    }, timeoutMs);
+    proc.stdout.on('data', (d) => {
+      stdout += d.toString();
+      if (stdout.length > 200000) stdout = stdout.slice(-200000);
+    });
+    proc.stderr.on('data', (d) => {
+      stderr += d.toString();
+      if (stderr.length > 20000) stderr = stderr.slice(-20000);
+    });
+    proc.on('close', (code) => {
+      done = true;
+      clearTimeout(timer);
+      resolve({ code: code ?? -1, stdout, stderr });
+    });
+    proc.on('error', (err) => {
+      done = true;
+      clearTimeout(timer);
+      resolve({ code: -1, stdout, stderr: stderr + '\n' + err.message });
+    });
+  });
+}
+
+// yt-dlp-এর এররকে ইউজারের বোঝার মতো বাংলায় অনুবাদ করি
+function friendlyYtDlpError(stderr: string): string {
+  const s = (stderr || '').toLowerCase();
+  if (s.includes('empty media response') || s.includes('login required') || s.includes('rate-limit') || s.includes('login needed')) {
+    return 'এই ভিডিওটি লগইন ছাড়া পাওয়া যাচ্ছে না (প্রাইভেট বা সীমাবদ্ধ)। পাবলিক পোস্ট/রিল দিয়ে চেষ্টা করুন।';
+  }
+  if (s.includes('private video') || s.includes('this video is private') || s.includes('not available') || s.includes('removed') || s.includes('unavailable')) {
+    return 'ভিডিওটি প্রাইভেট বা মুছে ফেলা হয়েছে।';
+  }
+  if (s.includes('unsupported url')) {
+    return 'এই লিংকটি সাপোর্টেড না।';
+  }
+  if (s.includes('max-filesize') || s.includes('larger than')) {
+    return 'ফাইলটি অনেক বড় (৪০০MB-এর বেশি)। ছোট ভিডিও/রিল দিয়ে চেষ্টা করুন।';
+  }
+  if (s.includes('enoent') || s.includes('no such file or directory')) {
+    return 'ডাউনলোড ইঞ্জিন (yt-dlp) পাওয়া যায়নি — সার্ভার আপডেট করা দরকার।';
+  }
+  if (s.includes('urlopen error') || s.includes('failed to resolve') || s.includes('timed out') || s.includes('timeout')) {
+    return 'নেটওয়ার্ক সমস্যা হয়েছে — একটু পরে আবার চেষ্টা করুন।';
+  }
+  const lastLine = (stderr || '').trim().split('\n').filter(Boolean).pop() || '';
+  return `ভিডিও ডাউনলোড ব্যর্থ হয়েছে। ${lastLine.slice(0, 160)}`;
+}
+
+// Facebook / TikTok / Instagram থেকে অডিও (বা ভিডিও) ডাউনলোড + ক্যাশ
+async function fetchMasterAudioForYtDlp(
+  platform: string,
+  url: string
+): Promise<{ success: boolean; cachedPath?: string; title?: string; error?: string }> {
+  const cacheKey = `ytdlp-${platform}-${createHash('md5').update(url).digest('hex').slice(0, 16)}`;
+
+  // 1. ক্যাশে আগে থেকে থাকলে সেটাই দিই
+  try {
+    const cachedFiles = fs.readdirSync(CACHE_DIR).filter((f) => f.startsWith(cacheKey + '.'));
+    for (const f of cachedFiles) {
+      const p = path.join(CACHE_DIR, f);
+      if (fs.statSync(p).size > 1024) {
+        return { success: true, cachedPath: p };
+      }
+    }
+  } catch {}
+
+  // 2. একই URL-এর ডাউনলোড আগেই চলছে কি না (ডাবল কাজ ঠেকাতে)
+  const inflightKey = `url:${url}`;
+  if (inFlightConversions.has(inflightKey)) {
+    return inFlightConversions.get(inflightKey)!;
+  }
+
+  const conversionPromise = (async () => {
+    const attempts = platform === 'facebook' ? [false, true] : [true, false]; // [impersonate on/off ক্রম]
+    let lastError = '';
+
+    for (const withImpersonate of attempts) {
+      const tmpDir = path.join(CACHE_DIR, `tmp-${cacheKey}-${Date.now()}`);
+      try {
+        fs.mkdirSync(tmpDir, { recursive: true });
+      } catch {}
+
+      const args = [
+        ...ytDlpBaseArgs(withImpersonate),
+        '--no-simulate',
+        '-f', 'bestaudio/best',
+        '-o', path.join(tmpDir, 'media.%(ext)s'),
+        '--print', '%(title)s',
+        '--print', 'after_move:filepath',
+        url,
+      ];
+
+      const result = await runYtDlp(args, 330000);
+      const lines = result.stdout.split('\n').map((l) => l.trim()).filter(Boolean);
+      let filePath: string | null = null;
+      for (const line of lines) {
+        try {
+          if (line.startsWith('/') && fs.existsSync(line) && fs.statSync(line).isFile()) filePath = line;
+        } catch {}
+      }
+
+      if (result.code === 0 && filePath && fs.existsSync(filePath) && fs.statSync(filePath).size > 1024) {
+        const pathIdx = lines.findIndex((l) => l === filePath);
+        const title =
+          (pathIdx > 0 ? lines.slice(0, pathIdx).join(' ') : lines[0] || '').slice(0, 180).trim() || undefined;
+
+        const finalPath = path.join(CACHE_DIR, `${cacheKey}${path.extname(filePath)}`);
+        try {
+          fs.renameSync(filePath, finalPath);
+        } catch {
+          fs.copyFileSync(filePath, finalPath);
+        }
+        try {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        } catch {}
+        return { success: true, cachedPath: finalPath, title };
+      }
+
+      try {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      } catch {}
+      lastError = result.stderr || result.stdout || lastError;
+      console.error(`yt-dlp attempt (impersonate=${withImpersonate}) failed for ${url}:`, lastError.slice(0, 400));
+    }
+
+    return { success: false, error: friendlyYtDlpError(lastError) };
+  })();
+
+  inFlightConversions.set(inflightKey, conversionPromise);
+  try {
+    return await conversionPromise;
+  } finally {
+    inFlightConversions.delete(inflightKey);
+  }
+}
+
+// Facebook / TikTok / Instagram — ভিডিওর তথ্য (টাইটেল, দৈর্ঘ্য, থাম্বনেইল, সাইজ)
+async function getYtDlpMediaInfo(
+  platform: string,
+  url: string
+): Promise<{ ok: boolean; error?: string; data?: Record<string, any> }> {
+  const attempts = platform === 'facebook' ? [false, true] : [true, false];
+  let lastError = '';
+
+  for (const withImpersonate of attempts) {
+    const args = [...ytDlpBaseArgs(withImpersonate), '--dump-single-json', '--skip-download', url];
+    const result = await runYtDlp(args, 45000);
+    if (result.code === 0 && result.stdout.trim()) {
+      try {
+        const data = JSON.parse(result.stdout.slice(result.stdout.indexOf('{')));
+        const durNum = typeof data.duration === 'number' && data.duration > 0 ? Math.round(data.duration) : null;
+
+        let duration: string | null = null;
+        if (durNum) {
+          const mins = Math.floor(durNum / 60);
+          const secs = durNum % 60;
+          duration = `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+        }
+
+        // আসল ফাইল-সাইজ থাকলে সেটাই, নাহলে দৈর্ঘ্য থেকে অনুপাতিক হিসাব
+        const formats: any[] = data.formats || [];
+        const withSizes = (list: any[]) =>
+          list
+            .filter((f) => f.filesize || f.filesize_approx)
+            .sort((a, b) => (b.filesize || b.filesize_approx) - (a.filesize || a.filesize_approx));
+
+        let audioSize: string | null = null;
+        let videoSize: string | null = null;
+        const audioFormats = formats.filter((f) => f.vcodec === 'none' && f.acodec && f.acodec !== 'none');
+        const audioPick = withSizes(audioFormats)[0];
+        if (audioPick) {
+          const size = audioPick.filesize || audioPick.filesize_approx;
+          if (size) audioSize = (size / (1024 * 1024)).toFixed(1) + ' MB';
+        }
+        const videoPick = withSizes(formats.filter((f) => f.vcodec && f.vcodec !== 'none'))[0];
+        if (videoPick) {
+          const size = videoPick.filesize || videoPick.filesize_approx;
+          if (size) videoSize = (size / (1024 * 1024)).toFixed(1) + ' MB';
+        }
+        if (durNum) {
+          if (!audioSize) audioSize = '~' + ((durNum * 32) / 1024).toFixed(1) + ' MB';
+          if (!videoSize) videoSize = '~' + ((durNum * 120) / 1024).toFixed(1) + ' MB';
+        }
+
+        return {
+          ok: true,
+          data: {
+            videoId: data.id || url,
+            platform,
+            title: (data.title || data.description || 'video').slice(0, 200),
+            author: data.uploader || data.channel || data.creator || platform,
+            thumbnail: data.thumbnail || null,
+            duration,
+            videoSize,
+            audioSize,
+          },
+        };
+      } catch {
+        // JSON পার্স ব্যর্থ — পরের অ্যাটেম্পটে চেষ্টা করি
+      }
+    }
+    lastError = result.stderr || lastError;
+  }
+
+  return { ok: false, error: friendlyYtDlpError(lastError) };
+}
+
 // SSE progress endpoint
 app.get('/api/convert-progress/:jobId', (req, res) => {
   const { jobId } = req.params;
@@ -481,10 +745,20 @@ app.get('/api/youtube-info', async (req, res) => {
     }
 
     const videoInfo = extractVideoId(rawUrl);
+
+    // NEW: Facebook / TikTok / Instagram — yt-dlp দিয়ে ভিডিওর তথ্য আনি
+    if (videoInfo.platform === 'facebook' || videoInfo.platform === 'tiktok' || videoInfo.platform === 'instagram') {
+      const info = await getYtDlpMediaInfo(videoInfo.platform, videoInfo.url);
+      if (!info.ok) {
+        return res.status(404).json({ ok: false, error: info.error || 'ভিডিওর তথ্য পাওয়া যায়নি।' });
+      }
+      return res.json({ ok: true, ...info.data });
+    }
+
     const videoId = videoInfo.platform === 'youtube' ? videoInfo.id : null;
     
     if (!videoId) {
-      return res.status(400).json({ ok: false, error: 'সঠিক ইউটিউব লিঙ্ক বা ভিডিও আইডি পাওয়া যায়নি।' });
+      return res.status(400).json({ ok: false, error: 'সাপোর্টেড প্ল্যাটফর্ম: ইউটিউব, ফেসবুক, টিকটক, ইনস্টাগ্রাম। সঠিক লিঙ্ক দিন।' });
     }
 
     // Check if we have cached audio for instant duration
@@ -568,17 +842,22 @@ app.get('/api/youtube-info', async (req, res) => {
 });
 
 // 2. Convert YouTube/Social Media to Audio (Async)
-app.post('/api/convert-video', async (req, res) => {
-  const { url, format = 'mp3', customName, bitrate } = req.body;
+app.post('/api/convert-video', async (req, res, next) => {
+  // FIX: ফাইল আপলোড (multipart/form-data) রিকোয়েস্ট হলে এই রাউট বাদ দিয়ে
+  // নিচের ফাইল-আপলোড রাউটে (multer) পাঠাই — আগে আপলোডগুলো এখানেই
+  // "লিঙ্ক আবশ্যক" এররে আটকে যেত (ফাইল-আপলোড ফিচার ভাঙা ছিল)।
+  if (req.is('multipart/form-data')) return next();
+
+  const { url, format = 'mp3', customName, bitrate } = req.body || {};
   if (!url) return res.status(400).json({ ok: false, error: 'লিঙ্ক আবশ্যক।' });
 
   const videoInfo = extractVideoId(url);
   if (!videoInfo.url) return res.status(400).json({ ok: false, error: 'সঠিক লিঙ্ক পাওয়া যায়নি।' });
 
-  if (videoInfo.platform !== 'youtube') {
-    return res.status(501).json({ ok: false, error: `${videoInfo.platform} বর্তমানে সাপোর্ট করে না। শুধুমাত্র ইউটিউব সাপোর্ট করে।` });
+  const SUPPORTED_PLATFORMS = ['youtube', 'facebook', 'tiktok', 'instagram'];
+  if (!SUPPORTED_PLATFORMS.includes(videoInfo.platform)) {
+    return res.status(501).json({ ok: false, error: 'এই লিঙ্কটি সাপোর্টেড না। ইউটিউব, ফেসবুক, টিকটক বা ইনস্টাগ্রাম লিঙ্ক দিন।' });
   }
-
   const jobId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
   jobRegistry.set(jobId, { status: 'pending', progress: 0 });
 
@@ -586,31 +865,45 @@ app.post('/api/convert-video', async (req, res) => {
   (async () => {
     try {
       jobRegistry.set(jobId, { status: 'downloading', progress: 10 });
-      // 1. Fetch title
+      // 1. Fetch title (ইউটিউব: oEmbed | FB/TikTok/IG: yt-dlp ডাউনলোড থেকেই আসবে)
       let videoTitle = 'audio-track';
-      try {
-        const oembed = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoInfo.id}&format=json`, { signal: AbortSignal.timeout(3000) });
-        if (oembed.ok) {
-          const d = await oembed.json();
-          if (d.title) videoTitle = d.title;
-        }
-      } catch {}
+      if (videoInfo.platform === 'youtube') {
+        try {
+          const oembed = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoInfo.id}&format=json`, { signal: AbortSignal.timeout(3000) });
+          if (oembed.ok) {
+            const d = await oembed.json();
+            if (d.title) videoTitle = d.title;
+          }
+        } catch {}
+      }
 
       const targetFormat = format && format !== 'auto' ? format.toLowerCase() : 'mp3';
       const fmtDetails = getFormatDetails(targetFormat);
-      const baseName = sanitizeFilename(customName || videoTitle || 'video-audio');
-      const finalFilename = `${baseName}${fmtDetails.ext}`;
       const fileId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
       const outputFilePath = path.join(OUTPUTS_DIR, `${fileId}${fmtDetails.ext}`);
 
       jobRegistry.set(jobId, { status: 'downloading', progress: 30 });
-      // Fetch or reuse master audio stream
-      const masterResult = await fetchMasterAudioForVideo(videoInfo.id!);
+      // Fetch or reuse master audio stream (ইউটিউব = লোডার ইঞ্জিন | FB/TikTok/IG = yt-dlp)
+      const masterResult =
+        videoInfo.platform === 'youtube'
+          ? await fetchMasterAudioForVideo(videoInfo.id!)
+          : await fetchMasterAudioForYtDlp(videoInfo.platform, videoInfo.url);
 
       if (!masterResult.success || !masterResult.cachedPath || !fs.existsSync(masterResult.cachedPath)) {
-        jobRegistry.set(jobId, { status: 'error', progress: 0, error: 'ইউটিউব ভিডিও থেকে অডিও পাওয়া যায়নি।' });
+        jobRegistry.set(jobId, {
+          status: 'error',
+          progress: 0,
+          error: masterResult.error || `${PLATFORM_NAMES[videoInfo.platform] || ''} থেকে অডিও পাওয়া যায়নি।`,
+        });
         return;
       }
+
+      // yt-dlp থেকে টাইটেল পেলে সেটাও ব্যবহার করি
+      if (masterResult.title && (!customName || customName === 'audio-track')) {
+        videoTitle = masterResult.title;
+      }
+      const baseName = sanitizeFilename(customName || videoTitle || 'video-audio');
+      const finalFilename = `${baseName}${fmtDetails.ext}`;
 
       jobRegistry.set(jobId, { status: 'extracting', progress: 60 });
       const qualityAnalysis = await analyzeMediaQuality(masterResult.cachedPath);
@@ -703,6 +996,10 @@ app.post('/api/convert-video', upload.single('video'), async (req, res) => {
       if (fs.existsSync(inputFilePath)) fs.unlinkSync(inputFilePath);
     } catch {}
 
+    // CRASH FIX: spawn fail করলে 'error' হ্যান্ডলার আগেই রেসপন্স দেয়;
+    // তখন এখানে আরেকবার রেসপন্স দিলে সার্ভার ক্র্যাশ করত (ERR_HTTP_HEADERS_SENT)
+    if (res.headersSent) return;
+
     if (code === 0 && fs.existsSync(outputFilePath)) {
       const stat = fs.statSync(outputFilePath);
       const exactDuration = await getAudioDurationSeconds(outputFilePath);
@@ -740,6 +1037,7 @@ app.post('/api/convert-video', upload.single('video'), async (req, res) => {
     try {
       if (fs.existsSync(inputFilePath)) fs.unlinkSync(inputFilePath);
     } catch {}
+    if (res.headersSent) return;
     return res.status(500).json({
       ok: false,
       error: 'কনভার্সন প্রসেস শুরু করা যায়নি: ' + err.message,
@@ -811,7 +1109,11 @@ app.get('/api/stream/:fileId', (req, res) => {
 // Dev Server vs Production Setup
 // ---------------------------------------------------------------------------
 async function startServer() {
-  const isProd = process.env.NODE_ENV === 'production';
+  // RENDER FIX: NODE_ENV সেট না থাকলেও, বিল্ড করা dist ফোল্ডার থাকলে
+  // প্রোডাকশন মোডে চলবে (Vite dev server চালু হবেই না → "Blocked request" এরর অসম্ভব)।
+  const isProd =
+    process.env.NODE_ENV === 'production' ||
+    fs.existsSync(path.join(__dirname, 'dist', 'index.html'));
 
   if (!isProd) {
     const { createServer: createViteServer } = await import('vite');
@@ -838,6 +1140,14 @@ async function startServer() {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
+
+  // yt-dlp উপলব্ধ কিনা চেক (Facebook/TikTok/Instagram সাপোর্টের জন্য দরকার)
+  const ytdlpProbe = await runYtDlp(['--version'], 15000);
+  console.log(
+    ytdlpProbe.code === 0
+      ? `yt-dlp ready: v${ytdlpProbe.stdout.trim()}`
+      : 'yt-dlp NOT FOUND — Facebook/TikTok/Instagram সাপোর্ট নিষ্ক্রিয় থাকবে'
+  );
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server listening on port ${PORT}`);
