@@ -263,7 +263,12 @@ export default function App() {
       try {
         const infoRes = await fetch(`/api/youtube-info?url=${encodeURIComponent(targetUrl)}`, { signal: AbortSignal.timeout(6000) });
         if (infoRes.ok) {
-          const infoData: YouTubeInfo = await infoRes.json();
+          let infoData: YouTubeInfo;
+          try {
+            infoData = await infoRes.json();
+          } catch {
+            throw new Error('সার্ভার থেকে সঠিক রেসপন্স পাওয়া যায়নি।');
+          }
           if (infoData.title) videoTitle = infoData.title;
           if (infoData.audioSize) {
             const parsed = parseFloat(infoData.audioSize.replace(/[^\d.]/g, ''));
@@ -280,7 +285,13 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: targetUrl, format: 'mp3', customName: videoTitle, bitrate: audioQuality }),
       });
-      const { ok, jobId, error } = await convertRes.json();
+      let convertResult;
+      try {
+        convertResult = await convertRes.json();
+      } catch {
+        throw new Error('সার্ভার কানেকশন ব্যর্থ হয়েছে।');
+      }
+      const { ok, jobId, error } = convertResult;
       if (!ok) throw new Error(error || 'কনভার্ট শুরু করা যায়নি।');
 
       // 3. SSE Progress tracking

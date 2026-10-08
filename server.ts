@@ -143,7 +143,7 @@ interface SourceQualityAnalysis {
  */
 async function analyzeMediaQuality(filePath: string): Promise<SourceQualityAnalysis> {
   return new Promise((resolve) => {
-    const proc = spawn('/usr/bin/ffprobe', [
+    const proc = spawn('ffprobe', [
       '-v', 'error',
       '-show_streams',
       '-of', 'json',
@@ -245,7 +245,7 @@ const BROWSER_UA =
 
 async function getAudioDurationSeconds(filePath: string): Promise<number | null> {
   return new Promise((resolve) => {
-    const proc = spawn('/usr/bin/ffprobe', [
+    const proc = spawn('ffprobe', [
       '-v', 'error',
       '-show_entries', 'format=duration',
       '-of', 'default=noprint_wrappers=1:nokey=1',
@@ -276,7 +276,7 @@ async function transcodeAudioFile(
 ): Promise<boolean> {
   const fmtDetails = getFormatDetails(targetFormat, bitrate);
   return new Promise((resolve) => {
-    const ffmpegProc = spawn('/usr/bin/ffmpeg', [
+    const ffmpegProc = spawn('ffmpeg', [
       '-i',
       inputAudioPath,
       '-vn',
@@ -480,7 +480,9 @@ app.get('/api/youtube-info', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'ইউটিউব লিঙ্ক প্রদান করুন।' });
     }
 
-    const videoId = extractYouTubeId(rawUrl);
+    const videoInfo = extractVideoId(rawUrl);
+    const videoId = videoInfo.platform === 'youtube' ? videoInfo.id : null;
+    
     if (!videoId) {
       return res.status(400).json({ ok: false, error: 'সঠিক ইউটিউব লিঙ্ক বা ভিডিও আইডি পাওয়া যায়নি।' });
     }
@@ -694,7 +696,7 @@ app.post('/api/convert-video', upload.single('video'), async (req, res) => {
     outputFilePath,
   ];
 
-  const ffmpegProcess = spawn('/usr/bin/ffmpeg', ffmpegArgs);
+  const ffmpegProcess = spawn('ffmpeg', ffmpegArgs);
 
   ffmpegProcess.on('close', async (code) => {
     try {
