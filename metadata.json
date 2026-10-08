@@ -1,6 +1,6 @@
 {
-  "name": "v-to-a-converter",
-  "description": "ইউটিউব লিঙ্ক বা যেকোনো ভিডিও ফাইল থেকে সহজে MP3, AAC, OGG ও WAV অডিওতে কনভার্ট এবং আইফোনে সরাসরি ডাউনলোড করার সহজ ওয়েব অ্যাপ।",
+  "name": "V to A",
+  "description": "Youtube,Facebook,Instragram,Tiktok Audio Dawnloader",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
