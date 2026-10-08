@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: v-to-a-converter
+    runtime: docker
+    envVars:
+      - key: NODE_ENV
+        value: production
+    ports:
+      - port: 3000
