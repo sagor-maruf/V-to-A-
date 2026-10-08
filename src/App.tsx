@@ -460,6 +460,16 @@ export default function App() {
         .then(() => {
           setPlayingId(item.id);
           setIsPlaying(true);
+          
+          // Media Session API for background control
+          if ('mediaSession' in navigator) {
+            navigator.mediaSession.metadata = new MediaMetadata({
+              title: item.title,
+              artist: 'V to A App',
+            });
+            navigator.mediaSession.setActionHandler('play', () => audio.play());
+            navigator.mediaSession.setActionHandler('pause', () => audio.pause());
+          }
         })
         .catch((e) => {
           console.error('Audio play error:', e);
@@ -509,7 +519,7 @@ export default function App() {
     <div
       className="fixed inset-0 w-full h-[100dvh] max-h-[100dvh] overflow-hidden overscroll-none text-white flex flex-col justify-between items-center px-4 select-none font-['Plus_Jakarta_Sans',sans-serif] touch-none"
       style={{
-        background: 'radial-gradient(ellipse 95% 70% at 50% 25%, #2a2d36 0%, #1a1c22 45%, #101115 100%)',
+        background: '#0f0f0f',
       }}
     >
       {/* Ambient soft silver/grey vignette and subtle texture lighting */}
@@ -669,10 +679,10 @@ export default function App() {
           onPointerLeave={() => {
             if (longPressTimer.current) clearTimeout(longPressTimer.current);
           }}
-          className="group flex items-center gap-2.5 text-[#9ba0b1] hover:text-white transition-all duration-300 py-2.5 px-6 rounded-full hover:bg-white/[0.06] active:scale-95 cursor-pointer touch-manipulation"
+          className="group flex flex-col items-center gap-2 text-[#d4af37] hover:text-white transition-all duration-300 py-2.5 px-6 rounded-full hover:bg-white/[0.06] active:scale-95 cursor-pointer touch-manipulation"
         >
-          <DotMatrixIcon className="w-4 h-4 text-[#7d8293] group-hover:text-white transition-colors duration-300" />
-          <span className="text-xs sm:text-sm font-medium tracking-[0.25em] uppercase">
+          <DotMatrixIcon className="w-8 h-8 text-[#d4af37] group-hover:text-white transition-colors duration-300" />
+          <span className="text-[10px] sm:text-xs font-medium tracking-[0.25em] uppercase">
             AUDIOS
           </span>
           {history.length > 0 && (
@@ -745,14 +755,17 @@ export default function App() {
                     key={item.id}
                     className="py-3 px-3 rounded-xl hover:bg-[#20222a] transition-colors flex items-center justify-between gap-3 group"
                   >
-                    {/* Play/Pause Button */}
+                    {/* Play/Pause Button - Hexagonal Shape */}
                     <button
                       onClick={() => togglePlayAudio(item)}
-                      className={`w-9 h-9 rounded-full flex-shrink-0 flex items-center justify-center transition-all cursor-pointer ${
+                      className={`w-9 h-9 flex-shrink-0 flex items-center justify-center transition-all cursor-pointer ${
                         playingId === item.id && isPlaying
                           ? 'bg-white text-black shadow-md'
                           : 'bg-[#262832] text-[#d5d8e6] hover:bg-[#323542] hover:text-white'
                       }`}
+                      style={{
+                        clipPath: 'polygon(50% 0%, 93% 25%, 93% 75%, 50% 100%, 7% 75%, 7% 25%)',
+                      }}
                       aria-label="Play audio preview"
                     >
                       {playingId === item.id && isPlaying ? (
